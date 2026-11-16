@@ -103,8 +103,8 @@ def write_database_download(setup_dir):
     if (git("status", "--porcelain", "--", database_path)):
         raise RuntimeError(f"{database_path} has uncommitted changes; commit and push it first.")
     commit = git("log", "-1", "--format=%H", "--", database_path)
-    if (not git("branch", "--remotes", "--contains", commit)):
-        raise RuntimeError(f"The commit with the current card database ({commit}) hasn't been pushed; push it first.")
+    if (not git("branch", "--remotes", "--contains", commit, "--list", "origin/*")):
+        raise RuntimeError(f"The commit with the current card database ({commit}) hasn't been pushed to origin; push it first.")
     repository = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)(.+?)(?:\.git)?", git("remote", "get-url", "origin")).group(1)
     repository_path = git("ls-files", "--full-name", database_path)
 
