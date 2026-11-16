@@ -3,32 +3,37 @@
 
 # Run by a packaged build's launcher before Main.py. The package leaves out torch, its GPU libraries, the models and the
 # card database, as together they're several GB and which torch build a machine can use depends on its GPU, so they're
-# downloaded here on first run. Exits with 0 once everything is in place.
+# downloaded here on first run, as listed in setup/setup.json by the build. Exits with 0 once everything is in place.
 
 import ctypes
 import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
+import urllib.request
 from PyQt6.QtCore import QProcess
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget
-from Settings import Settings
+from Settings import Settings, TRAINING_DIR
 
 PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETUP_DIR = os.path.join(PACKAGE_DIR, "setup")
+WHEELS_DIR = os.path.join(SETUP_DIR, "wheels")
 PACKAGES_INSTALLED_PATH = os.path.join(PACKAGE_DIR, "python", "packages_installed")
-
-# Pinned so an upstream change can't stop the models matching the embeddings in the card database.
-MODELS = [
-    (Settings.CARD_INFERENCE_MODEL_PATH, "openai/clip-vit-base-patch32", "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268", "CLIPModel", "CLIPProcessor"),
-    (Settings.CARD_OCR_MODEL_PATH, "microsoft/trocr-base-printed", "93450be3f1ed40a930690d951ef3932687cc1892", "VisionEncoderDecoderModel", "TrOCRProcessor"),
-]
 
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
+
+# Printed by each step as it downloads, for the window to show; the numbers are bytes through the whole step.
+PROGRESS_PATTERN = re.compile(r"Progress (\d+) of (\d+)")
+
+def load_setup():
+    with open(os.path.join(SETUP_DIR, "setup.json")) as file:
+        return json.load(file)
 
 # Asks the NVIDIA driver directly, as torch isn't installed yet.
 def is_cuda_device_supported(driver_major_version, compute_capability):
@@ -48,105 +53,151 @@ def is_cuda_device_supported(driver_major_version, compute_capability):
     return (version.value // 1000 >= driver_major_version and (major.value, minor.value) >= tuple(compute_capability))
 
 # The first variant the machine can run, listed by the build with the GPU ones first.
-def choose_variant():
-    with open(os.path.join(SETUP_DIR, "variants.json")) as file:
-        variants = json.load(file)
-    for variant in variants:
+def choose_variant(setup):
+    for variant in setup["variants"]:
         if ("cuda_driver_major_version" not in variant):
             return variant
         if (is_cuda_device_supported(variant["cuda_driver_major_version"], variant["compute_capability"])):
             return variant
 
+def model_path(model):
+    return os.path.join(TRAINING_DIR, model["path"])
+
 def are_packages_installed():
     return os.path.exists(PACKAGES_INSTALLED_PATH)
-
-def mark_packages_installed():
-    with open(PACKAGES_INSTALLED_PATH, "w") as file:
-        file.write("")
-
-def are_models_downloaded():
-    for path, repository, revision, model_class, processor_class in MODELS:
-        if (not os.path.exists(path)):
-            return False
-    return True
 
 def is_database_downloaded():
     return os.path.exists(Settings.CARD_INFERENCE_DATABASE_PATH)
 
-def download_database():
-    import requests
+def missing_models(setup):
+    models = []
+    for model in setup["models"]:
+        if (not os.path.exists(model_path(model))):
+            models.append(model)
+    return models
 
-    with open(os.path.join(SETUP_DIR, "database.json")) as file:
-        database = json.load(file)
-    path = Settings.CARD_INFERENCE_DATABASE_PATH
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    print(f"Downloading {database['url']}")
+def files_size(files):
+    size = 0
+    for file in files:
+        size += file["size"]
+    return size
 
-    # Written beside the database and moved in once it's complete and checked, so an interrupted or corrupt download
-    # is started again.
-    temp_path = f"{path}.download"
-    digest = hashlib.sha256()
-    downloaded = 0
-    with requests.get(database["url"], stream=True, timeout=60) as response:
-        response.raise_for_status()
-        with open(temp_path, "wb") as file:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                file.write(chunk)
-                digest.update(chunk)
-                downloaded += len(chunk)
-                print(f"Progress {downloaded} of {database['size']}")
-    if (digest.hexdigest() != database["sha256"]):
-        os.remove(temp_path)
-        raise RuntimeError("The downloaded card database doesn't match the one this version was built with.")
-    os.replace(temp_path, path)
-    print("Saved the card database")
+def open_url(url):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "libre-card-sorter"}), timeout=60)
 
-def download_models():
-    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+# Downloads each file to its path, checking its hash. Each is written beside its path and moved in once it's complete
+# and checked, so a file that's there is complete, and an interrupted download carries on from the next file. Files the
+# package ships, which have no URL, are already there.
+def download_files(files, paths):
+    total = files_size(files)
+    done = 0
+    for file, path in zip(files, paths):
+        if (not os.path.exists(path)):
+            print(f"Downloading {file['name']}")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            temp_path = f"{path}.download"
+            digest = hashlib.sha256()
+            downloaded = 0
+            with open_url(file["url"]) as response, open(temp_path, "wb") as output:
+                for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                    output.write(chunk)
+                    digest.update(chunk)
+                    downloaded += len(chunk)
+                    print(f"Progress {done + min(downloaded, file['size'])} of {total}")
+            if (digest.hexdigest() != file["sha256"]):
+                os.remove(temp_path)
+                raise RuntimeError(f"{file['name']} didn't download correctly (its hash doesn't match).")
+            os.replace(temp_path, path)
+        done += file["size"]
+        print(f"Progress {done} of {total}")
+
+def download_packages(setup):
+    wheels = choose_variant(setup)["wheels"]
+    paths = []
+    for wheel in wheels:
+        paths.append(os.path.join(WHEELS_DIR, wheel["name"]))
+    download_files(wheels, paths)
+
+def install_packages(setup):
+    arguments = [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", "--disable-pip-version-check", "--no-warn-script-location"]
+    for wheel in choose_variant(setup)["wheels"]:
+        arguments.append(os.path.join(WHEELS_DIR, wheel["name"]))
+    subprocess.run(arguments, check=True)
+    with open(PACKAGES_INSTALLED_PATH, "w") as file:
+        file.write("")
+    shutil.rmtree(WHEELS_DIR)
+
+# Always the latest database on the repository's main branch; its Git LFS pointer there gives its hash and size.
+def download_database(setup):
+    with open_url(setup["database"]["pointer_url"]) as response:
+        pointer = response.read().decode()
+    database = {
+        "name": "the card database",
+        "url": setup["database"]["url"],
+        "sha256": re.search(r"^oid sha256:(\w+)$", pointer, re.MULTILINE).group(1),
+        "size": int(re.search(r"^size (\d+)$", pointer, re.MULTILINE).group(1)),
+    }
+    download_files([database], [Settings.CARD_INFERENCE_DATABASE_PATH])
+
+def download_models(setup):
     import torch
     import transformers
     transformers.utils.logging.disable_progress_bar()
 
-    for path, repository, revision, model_class, processor_class in MODELS:
-        if (os.path.exists(path)):
-            continue
-        print(f"Downloading {repository}")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+    models = missing_models(setup)
+    files = []
+    paths = []
+    for model in models:
+        for file in model["files"]:
+            files.append(file)
+            paths.append(os.path.join(f"{model_path(model)}.download", file["name"]))
+    download_files(files, paths)
 
-        # Assembled beside its destination and moved in once complete, so an interrupted download is started again.
+    for model in models:
+        path = model_path(model)
+        download_dir = f"{path}.download"
+        print(f"Saving {model['path']}")
+        # Saved beside its destination and moved in once complete, so an interrupted save is done again.
         with tempfile.TemporaryDirectory(dir=os.path.dirname(path)) as work_dir:
-            cache_dir = os.path.join(work_dir, "cache")
             model_dir = os.path.join(work_dir, "model")
             # Halves the model's size. The app runs it in float16 on the GPU anyway, so its results there are unchanged.
-            model = getattr(transformers, model_class).from_pretrained(repository, revision=revision, cache_dir=cache_dir, dtype=torch.float16)
-            model.save_pretrained(model_dir)
-            processor = getattr(transformers, processor_class).from_pretrained(repository, revision=revision, cache_dir=cache_dir)
-            processor.save_pretrained(model_dir)
+            getattr(transformers, model["model_class"]).from_pretrained(download_dir, dtype=torch.float16).save_pretrained(model_dir)
+            getattr(transformers, model["processor_class"]).from_pretrained(download_dir).save_pretrained(model_dir)
             os.replace(model_dir, path)
-        print(f"Saved {repository}")
+        shutil.rmtree(download_dir)
+
+STEP_FUNCTIONS = {
+    "download-packages": download_packages,
+    "install-packages": install_packages,
+    "download-database": download_database,
+    "download-models": download_models,
+}
 
 class SetupStep:
-    def __init__(self, description, arguments, on_success):
+    # The weight is the step's share of the overall progress, in bytes downloaded.
+    def __init__(self, description, name, weight):
         self.description = description
-        self.arguments = arguments
-        self.on_success = on_success
+        self.name = name
+        self.weight = weight
 
-def setup_steps():
+def setup_steps(setup):
     steps = []
     if (not are_packages_installed()):
-        variant = choose_variant()
-        description = "Installing packages with NVIDIA GPU support" if ("cuda_driver_major_version" in variant) else "Installing packages (no supported NVIDIA GPU found, so cards are identified on the CPU)"
-        requirements = os.path.join(SETUP_DIR, variant["requirements"])
-        arguments = ["-u", "-m", "pip", "install", "--no-deps", "--no-cache-dir", "--disable-pip-version-check", "--no-warn-script-location", "--progress-bar", "raw", "-r", requirements]
-        steps.append(SetupStep(description, arguments, mark_packages_installed))
+        variant = choose_variant(setup)
+        if ("cuda_driver_major_version" in variant):
+            steps.append(SetupStep("Downloading packages with NVIDIA GPU support", "download-packages", files_size(variant["wheels"])))
+        else:
+            steps.append(SetupStep("Downloading packages (no supported NVIDIA GPU found, so cards are identified on the CPU)", "download-packages", files_size(variant["wheels"])))
+        steps.append(SetupStep("Installing packages", "install-packages", 0))
     if (not is_database_downloaded()):
-        steps.append(SetupStep("Downloading the card database", ["-u", os.path.abspath(__file__), "--download-database"], None))
-    if (not are_models_downloaded()):
-        steps.append(SetupStep("Downloading the card recognition models", ["-u", os.path.abspath(__file__), "--download-models"], None))
+        steps.append(SetupStep("Downloading the card database", "download-database", setup["database"]["estimated_size"]))
+    models = missing_models(setup)
+    if (models):
+        size = 0
+        for model in models:
+            size += files_size(model["files"])
+        steps.append(SetupStep("Downloading the card recognition models", "download-models", size))
     return steps
-
-# The format pip prints with --progress-bar raw, which the database download prints too.
-PROGRESS_PATTERN = re.compile(r"Progress (\d+) of (\d+)")
 
 class SetupWindow(QWidget):
     def __init__(self, steps):
@@ -154,15 +205,20 @@ class SetupWindow(QWidget):
         self.__steps = steps
         self.__step_index = 0
         self.__output = ""
+        self.__total_weight = 0
+        for step in steps:
+            self.__total_weight += step.weight
 
         self.setWindowTitle("Libre Card Sorter Setup")
-        self.resize(720, 420)
+        self.resize(720, 460)
 
-        intro = QLabel("Downloading what the card sorter needs to identify cards. This only happens on the first run, and can take a while.")
+        intro = QLabel("Downloading dependencies. This only happens on first run, and can take a while.")
         intro.setWordWrap(True)
+        self.__overall_label = QLabel()
+        self.__overall_bar = QProgressBar()
         self.__step_label = QLabel()
         self.__step_label.setWordWrap(True)
-        self.__progress_bar = QProgressBar()
+        self.__step_bar = QProgressBar()
         self.__log = QPlainTextEdit()
         self.__log.setReadOnly(True)
         self.__log.setMaximumBlockCount(2000)
@@ -178,8 +234,10 @@ class SetupWindow(QWidget):
         buttons.addWidget(quit_button)
         layout = QVBoxLayout(self)
         layout.addWidget(intro)
+        layout.addWidget(self.__overall_label)
+        layout.addWidget(self.__overall_bar)
         layout.addWidget(self.__step_label)
-        layout.addWidget(self.__progress_bar)
+        layout.addWidget(self.__step_bar)
         layout.addWidget(self.__log)
         layout.addLayout(buttons)
 
@@ -189,13 +247,24 @@ class SetupWindow(QWidget):
         self.__process.finished.connect(self.__step_finished)
         self.__start_step()
 
+    def __set_overall_progress(self, step_fraction):
+        done = 0
+        for step in self.__steps[:self.__step_index]:
+            done += step.weight
+        done += self.__steps[self.__step_index].weight * step_fraction
+        # In KiB, as the total in bytes can overflow the progress bar's int.
+        self.__overall_bar.setRange(0, max(1, self.__total_weight // 1024))
+        self.__overall_bar.setValue(int(done) // 1024)
+        self.__overall_label.setText(f"Overall: {done / 1e9:.2f} of {self.__total_weight / 1e9:.2f} GB")
+
     def __start_step(self):
         step = self.__steps[self.__step_index]
         self.__retry_button.hide()
         self.__step_label.setText(f"Step {self.__step_index + 1} of {len(self.__steps)}: {step.description}")
-        self.__progress_bar.setRange(0, 0)
+        self.__step_bar.setRange(0, 0)
+        self.__set_overall_progress(0)
         self.__output = ""
-        self.__process.start(sys.executable, step.arguments)
+        self.__process.start(sys.executable, ["-u", os.path.abspath(__file__), step.name])
 
     def __read_output(self):
         self.__output += bytes(self.__process.readAllStandardOutput()).decode(errors="replace")
@@ -205,24 +274,22 @@ class SetupWindow(QWidget):
             line = line.rstrip()
             match = PROGRESS_PATTERN.fullmatch(line)
             if (match):
-                # In KiB, as a download's size in bytes can overflow the progress bar's int.
-                self.__progress_bar.setRange(0, int(match.group(2)) // 1024)
-                self.__progress_bar.setValue(int(match.group(1)) // 1024)
+                done = int(match.group(1))
+                total = max(1, int(match.group(2)))
+                self.__step_bar.setRange(0, max(1, total // 1024))
+                self.__step_bar.setValue(done // 1024)
+                self.__set_overall_progress(done / total)
             elif (line):
-                self.__progress_bar.setRange(0, 0)
                 self.__log.appendPlainText(line)
 
     def __step_finished(self, exit_code, exit_status):
         if (exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0):
-            self.__step_label.setText(f"Step {self.__step_index + 1} of {len(self.__steps)} failed: {self.__steps[self.__step_index].description}. Check your internet connection and disk space, then retry.")
-            self.__progress_bar.setRange(0, 1)
-            self.__progress_bar.setValue(0)
+            self.__step_label.setText(f"Step {self.__step_index + 1} of {len(self.__steps)} failed: {self.__steps[self.__step_index].description}. The log below says why; check your internet connection and disk space, then retry.")
+            self.__step_bar.setRange(0, 1)
+            self.__step_bar.setValue(0)
             self.__retry_button.show()
             return
 
-        step = self.__steps[self.__step_index]
-        if (step.on_success):
-            step.on_success()
         self.__step_index += 1
         if (self.__step_index < len(self.__steps)):
             self.__start_step()
@@ -230,14 +297,12 @@ class SetupWindow(QWidget):
             self.close()
 
 def main():
-    if ("--download-models" in sys.argv):
-        download_models()
-        return 0
-    if ("--download-database" in sys.argv):
-        download_database()
+    setup = load_setup()
+    if (len(sys.argv) > 1):
+        STEP_FUNCTIONS[sys.argv[1]](setup)
         return 0
 
-    steps = setup_steps()
+    steps = setup_steps(setup)
     if (not steps):
         return 0
 
@@ -246,7 +311,7 @@ def main():
     window = SetupWindow(steps)
     window.show()
     app.exec()
-    return 0 if (are_packages_installed() and is_database_downloaded() and are_models_downloaded()) else 1
+    return 0 if (not setup_steps(setup)) else 1
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -4,12 +4,13 @@
 # Packages the UI into a standalone folder, Builds/<version>/, that runs without Python or the repository. The version
 # is Settings.VERSION. The package holds a Python runtime with only PyQt installed and the app; Bootstrap.py downloads
 # the rest on first run: pinned versions of what's installed in the UI's virtual environment, so it must be run with
-# that, and the card database as committed to the repository's GitHub remote, so it must be pushed first:
+# that, the models, and the latest card database on the main branch of the repository's GitHub remote:
 #
 #   cd software/ui
 #   .venv/bin/python Scripts/PackageBuild.py
 
 import argparse
+import fnmatch
 import hashlib
 import importlib.metadata
 import json
@@ -22,12 +23,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.parse
 import urllib.request
+import zipfile
 
 UI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, UI_DIR)
 
-from Settings import Settings
+from Settings import Settings, TRAINING_DIR
 
 APP_NAME = "LibreCardSorter"
 
@@ -40,12 +43,31 @@ PYTHON_RUNTIME_VERSION = (3, 15)
 EXCLUDED_PACKAGES = ["pip", "triton"]
 
 # The parts of the UI folder that aren't the app.
-NON_APP_FILES = [".venv", ".vscode", "Builds", "Scripts", "__pycache__", "requirements.txt"]
+NON_APP_FILES = [".venv", ".vscode", "Builds", "Scripts", "__pycache__", "requirements.txt", "requirements-lock.txt"]
+
+# The virtual environment's exact packages, written by each build so the GitHub release workflow can recreate it.
+LOCK_PATH = os.path.join(UI_DIR, "requirements-lock.txt")
 
 # The plugins QtGui and QtWidgets use; the rest are for other Qt modules.
 QT_PLUGIN_DIRS = ["egldeviceintegrations", "generic", "iconengines", "imageformats", "platforminputcontexts", "platforms", "platformthemes", "wayland-decoration-client", "wayland-graphics-integration-client", "wayland-shell-integration", "xcbglintegrations"]
 
+# Runs the package's Python as the launcher does, seeing only its own packages, not the user's (~/.local) or PYTHONPATH.
+def run_runtime_python(arguments, **options):
+    environment = dict(os.environ, PYTHONNOUSERSITE="1")
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    return subprocess.run(arguments, env=environment, check=True, **options)
+
 QT_MODULE_PATTERN = re.compile(r"PyQt6\.(Qt\w+)|from PyQt6 import ([\w, ]+)")
+
+def write_lock(packages):
+    cuda_tag = packages["torch"].partition("+")[2]
+    with open(LOCK_PATH, "w") as file:
+        file.write("# Written by Scripts/PackageBuild.py from the UI's virtual environment; recreate it with:\n")
+        file.write("#   python -m venv .venv && .venv/bin/python -m pip install -r requirements-lock.txt\n")
+        file.write(f"--extra-index-url https://download.pytorch.org/whl/{cuda_tag}\n")
+        for name in sorted(packages, key=str.lower):
+            file.write(f"{name}=={packages[name]}\n")
 
 def installed_packages():
     packages = {}
@@ -55,6 +77,29 @@ def installed_packages():
             packages[name] = distribution.version
     return packages
 
+# Pinned so an upstream change can't stop the models matching the embeddings in the card database.
+MODELS = [
+    (Settings.CARD_INFERENCE_MODEL_PATH, "openai/clip-vit-base-patch32", "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268", "CLIPModel", "CLIPProcessor"),
+    (Settings.CARD_OCR_MODEL_PATH, "microsoft/trocr-base-printed", "93450be3f1ed40a930690d951ef3932687cc1892", "VisionEncoderDecoderModel", "TrOCRProcessor"),
+]
+
+# Files in a model's repository that transformers doesn't need, being for other frameworks or documentation.
+MODEL_UNUSED_FILES = [".gitattributes", "*.md", "*.msgpack", "*.h5", "*.onnx", "*.ot"]
+
+def request(url, method="GET"):
+    return urllib.request.urlopen(urllib.request.Request(url, method=method, headers={"User-Agent": "libre-card-sorter-build"}))
+
+def download_size(url):
+    with request(url, "HEAD") as response:
+        return int(response.headers["Content-Length"])
+
+def download_sha256(url):
+    digest = hashlib.sha256()
+    with request(url) as response:
+        for chunk in iter(lambda: response.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 def write_requirements(path, index_url, packages):
     with open(path, "w") as file:
         file.write(f"--index-url {index_url}\n")
@@ -62,9 +107,53 @@ def write_requirements(path, index_url, packages):
         for name in sorted(packages, key=str.lower):
             file.write(f"{name}=={packages[name]}\n")
 
-# One set of requirements with the virtual environment's CUDA build of torch, for machines whose GPU it supports, and
-# one with the CPU build in its place, for everything else.
-def write_variants(setup_dir, packages):
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+# Asks pip which wheel it would download for each package, for the runtime's platform, without downloading them. A
+# package with no wheel for it is built into one here and shipped in the package, as setup installs offline.
+def resolve_wheels(python, index_url, packages, wheels_dir):
+    with tempfile.TemporaryDirectory() as work_dir:
+        requirements_path = os.path.join(work_dir, "requirements.txt")
+        report_path = os.path.join(work_dir, "report.json")
+        write_requirements(requirements_path, index_url, packages)
+        run_runtime_python([python, "-m", "pip", "install", "--dry-run", "--ignore-installed", "--no-deps", "--quiet", "--disable-pip-version-check", "--report", report_path, "-r", requirements_path])
+        with open(report_path) as file:
+            report = json.load(file)
+
+    wheels = []
+    for item in report["install"]:
+        url = item["download_info"]["url"]
+        name = os.path.basename(urllib.parse.unquote(url))
+        if (name.endswith(".whl")):
+            print(f"Resolved {name}")
+            wheels.append({"name": name, "url": url, "sha256": item["download_info"]["archive_info"]["hashes"]["sha256"], "size": download_size(url)})
+            continue
+
+        with tempfile.TemporaryDirectory() as build_dir:
+            run_runtime_python([python, "-m", "pip", "wheel", "--no-deps", "--quiet", "--disable-pip-version-check", "--wheel-dir", build_dir, url])
+            name = os.listdir(build_dir)[0]
+            os.makedirs(wheels_dir, exist_ok=True)
+            # Kept from the first variant that needs it, as a rebuild needn't be byte-identical to match its hash.
+            if (not os.path.exists(os.path.join(wheels_dir, name))):
+                shutil.copy2(os.path.join(build_dir, name), os.path.join(wheels_dir, name))
+        print(f"Built {name}")
+        path = os.path.join(wheels_dir, name)
+        # Compiled code would be built against this machine's libraries, so may not run on the users'.
+        with zipfile.ZipFile(path) as wheel:
+            for member in wheel.namelist():
+                if (member.endswith(".so")):
+                    raise RuntimeError(f"{name} was built with compiled code ({member}), which may not run on other machines.")
+        wheels.append({"name": name, "sha256": file_sha256(path), "size": os.path.getsize(path)})
+    return wheels
+
+# One set of wheels with the virtual environment's CUDA build of torch, for machines whose GPU it supports, and one
+# with the CPU build in its place, for everything else. PyQt is left out, as the package already has it.
+def package_variants(python, packages, wheels_dir):
     import torch
 
     cuda_tag = packages["torch"].partition("+")[2]
@@ -72,53 +161,87 @@ def write_variants(setup_dir, packages):
         raise RuntimeError(f"Expected a CUDA build of torch in the virtual environment, found {packages['torch']}")
 
     compute_capabilities = []
-    for arch in torch.cuda.get_arch_list():
+    # The architectures torch was built for, which unlike torch.cuda.get_arch_list() doesn't need a GPU to tell.
+    for arch in torch._C._cuda_getArchFlags().split():
         if (arch.startswith("sm_")):
             digits = re.match(r"\d+", arch[3:]).group()
             compute_capabilities.append((int(digits[:-1]), int(digits[-1])))
 
+    cuda_packages = {}
     cpu_packages = {}
     for name in packages:
-        if (name.lower().startswith("nvidia-") or name.lower().startswith("cuda-")):
+        if (name.lower().startswith("pyqt6")):
             continue
-        cpu_packages[name] = packages[name].replace(f"+{cuda_tag}", "+cpu")
+        cuda_packages[name] = packages[name]
+        if (not name.lower().startswith("nvidia-") and not name.lower().startswith("cuda-")):
+            cpu_packages[name] = packages[name].replace(f"+{cuda_tag}", "+cpu")
 
-    write_requirements(os.path.join(setup_dir, f"{cuda_tag}.txt"), f"https://download.pytorch.org/whl/{cuda_tag}", packages)
-    write_requirements(os.path.join(setup_dir, "cpu.txt"), "https://download.pytorch.org/whl/cpu", cpu_packages)
-    variants = [
-        {"requirements": f"{cuda_tag}.txt", "cuda_driver_major_version": int(torch.version.cuda.split(".")[0]), "compute_capability": min(compute_capabilities)},
-        {"requirements": "cpu.txt"},
+    return [
+        {"cuda_driver_major_version": int(torch.version.cuda.split(".")[0]), "compute_capability": min(compute_capabilities), "wheels": resolve_wheels(python, f"https://download.pytorch.org/whl/{cuda_tag}", cuda_packages, wheels_dir)},
+        {"wheels": resolve_wheels(python, "https://download.pytorch.org/whl/cpu", cpu_packages, wheels_dir)},
     ]
-    with open(os.path.join(setup_dir, "variants.json"), "w") as file:
-        json.dump(variants, file, indent=4)
 
-# The database is stored with Git LFS, so its contents are served at GitHub's media URL for the commit that last
-# changed it. That commit is checked to be pushed, and the database unchanged since, so the package gets the database
-# it was built and tested with.
-def write_database_download(setup_dir):
+# The database is stored with Git LFS, and setup downloads whatever's latest on the main branch of the repository's
+# GitHub remote, checked against the hash in its LFS pointer there. Its size there now only weights the overall
+# progress; it's read from the pointer, so the build doesn't need the database itself.
+def database_download():
     database_path = Settings.CARD_INFERENCE_DATABASE_PATH
     def git(*arguments):
         return subprocess.run(["git", *arguments], cwd=os.path.dirname(database_path), capture_output=True, text=True, check=True).stdout.strip()
 
-    if (git("status", "--porcelain", "--", database_path)):
-        raise RuntimeError(f"{database_path} has uncommitted changes; commit and push it first.")
-    commit = git("log", "-1", "--format=%H", "--", database_path)
-    if (not git("branch", "--remotes", "--contains", commit, "--list", "origin/*")):
-        raise RuntimeError(f"The commit with the current card database ({commit}) hasn't been pushed to origin; push it first.")
     repository = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)(.+?)(?:\.git)?", git("remote", "get-url", "origin")).group(1)
     repository_path = git("ls-files", "--full-name", database_path)
-
-    digest = hashlib.sha256()
-    with open(database_path, "rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    database = {
-        "url": f"https://media.githubusercontent.com/media/{repository}/{commit}/{repository_path}",
-        "sha256": digest.hexdigest(),
-        "size": os.path.getsize(database_path),
+    git("fetch", "--quiet", "origin", "main")
+    if (not git("ls-tree", "--full-tree", "origin/main", "--", repository_path)):
+        raise RuntimeError(f"{repository_path} isn't on origin's main branch, which first-run setup downloads it from.")
+    pointer = git("show", f"origin/main:{repository_path}")
+    return {
+        "pointer_url": f"https://raw.githubusercontent.com/{repository}/main/{repository_path}",
+        "url": f"https://media.githubusercontent.com/media/{repository}/main/{repository_path}",
+        "estimated_size": int(re.search(r"^size (\d+)$", pointer, re.MULTILINE).group(1)),
     }
-    with open(os.path.join(setup_dir, "database.json"), "w") as file:
-        json.dump(database, file, indent=4)
+
+def model_downloads():
+    models = []
+    for path, repository, revision, model_class, processor_class in MODELS:
+        with request(f"https://huggingface.co/api/models/{repository}/revision/{revision}?blobs=true") as response:
+            siblings = json.load(response)["siblings"]
+
+        names = []
+        for sibling in siblings:
+            unused = False
+            for pattern in MODEL_UNUSED_FILES:
+                if (fnmatch.fnmatch(sibling["rfilename"], pattern)):
+                    unused = True
+            if (not unused):
+                names.append(sibling["rfilename"])
+        has_safetensors = False
+        for name in names:
+            if (name.endswith(".safetensors")):
+                has_safetensors = True
+
+        files = []
+        for sibling in siblings:
+            name = sibling["rfilename"]
+            if (name not in names or (has_safetensors and name.endswith(".bin"))):
+                continue
+            url = f"https://huggingface.co/{repository}/resolve/{revision}/{name}"
+            # Hugging Face only lists hashes of files stored with LFS; the rest are small enough to hash here.
+            sha256 = sibling["lfs"]["sha256"] if (sibling.get("lfs")) else download_sha256(url)
+            files.append({"name": name, "url": url, "sha256": sha256, "size": sibling["size"]})
+        print(f"Resolved {repository}")
+        models.append({"path": os.path.relpath(path, TRAINING_DIR), "model_class": model_class, "processor_class": processor_class, "files": files})
+    return models
+
+# Everything first-run setup downloads, with each file's size so it can show overall progress, and hash to check it.
+def write_setup(setup_dir, python, packages):
+    setup = {
+        "variants": package_variants(python, packages, os.path.join(setup_dir, "wheels")),
+        "database": database_download(),
+        "models": model_downloads(),
+    }
+    with open(os.path.join(setup_dir, "setup.json"), "w") as file:
+        json.dump(setup, file, indent=4)
 
 def install_python_runtime(app_dir):
     with tempfile.TemporaryDirectory() as download_dir:
@@ -194,8 +317,11 @@ def prune_qt(site_packages_dir):
             remove_path(os.path.join(lib_dir, name))
 
 LAUNCHER = """#!/bin/sh
-# Runs first-run setup, which downloads what the package leaves out, then the app.
+# Runs first-run setup, which downloads what the package leaves out, then the app. Python is kept to the package's own
+# packages, not the user's (~/.local) or PYTHONPATH, which setup's steps and pip inherit.
 DIR="$(dirname "$(readlink -f "$0")")"
+unset PYTHONPATH PYTHONHOME
+export PYTHONNOUSERSITE=1
 "$DIR/python/bin/python3" "$DIR/app/Bootstrap.py" && exec "$DIR/python/bin/python3" "$DIR/app/Main.py" "$@"
 """
 
@@ -249,21 +375,21 @@ def main():
     app_dir = os.path.join(build_dir, APP_NAME)
     setup_dir = os.path.join(app_dir, "setup")
     os.makedirs(setup_dir)
-    write_database_download(setup_dir)
     install_python_runtime(app_dir)
     python = os.path.join(app_dir, "python", "bin", "python3")
 
     packages = installed_packages()
-    write_variants(setup_dir, packages)
+    write_lock(packages)
 
     # PyQt is installed up front, as the first-run setup's window needs it.
     qt_packages = []
     for name in packages:
         if (name.lower().startswith("pyqt6")):
             qt_packages.append(f"{name}=={packages[name]}")
-    subprocess.run([python, "-m", "pip", "install", "--no-deps", "--no-cache-dir", "--disable-pip-version-check", "--no-warn-script-location"] + qt_packages, check=True)
-    site_packages_dir = subprocess.run([python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], capture_output=True, text=True, check=True).stdout.strip()
+    run_runtime_python([python, "-m", "pip", "install", "--no-deps", "--no-cache-dir", "--disable-pip-version-check", "--no-warn-script-location"] + qt_packages)
+    site_packages_dir = run_runtime_python([python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], capture_output=True, text=True).stdout.strip()
     prune_qt(site_packages_dir)
+    write_setup(setup_dir, python, packages)
 
     shutil.copytree(UI_DIR, os.path.join(app_dir, "app"), ignore=shutil.ignore_patterns(*NON_APP_FILES))
     write_launcher(app_dir)

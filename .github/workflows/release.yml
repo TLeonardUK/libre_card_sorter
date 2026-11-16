@@ -1,0 +1,50 @@
+# Builds the UI's package (software/ui/Scripts/PackageBuild.py) and publishes it as a GitHub release tagged
+# v<Settings.VERSION>. Run it from the Actions tab once Settings.VERSION has been bumped.
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Must match the Python version the package's runtime and pinned packages are for.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.15"
+
+      - name: Check the version hasn't been released
+        id: version
+        working-directory: software/ui
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^ *VERSION = "\(.*\)"/\1/p' Settings.py)
+          if gh release view "v$version" > /dev/null 2>&1; then
+            echo "::error::v$version has already been released; bump Settings.VERSION."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Recreate the UI's virtual environment
+        working-directory: software/ui
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --no-cache-dir -r requirements-lock.txt
+
+      - name: Build the package
+        working-directory: software/ui
+        run: .venv/bin/python Scripts/PackageBuild.py
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${{ steps.version.outputs.version }}
+          gh release create "v$version" "software/ui/Builds/$version.zip" --target "$GITHUB_SHA" --title "Libre Card Sorter $version" --generate-notes
