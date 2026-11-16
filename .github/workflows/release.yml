@@ -1,6 +1,6 @@
-# Builds the UI's AppImage (software/ui/Scripts/PackageBuild.py) and the M4P board's Marlin firmware (mcu), zips the
-# CB1 board's server (mpu), and publishes them as a GitHub release tagged v<Settings.VERSION>. Run it from the Actions tab once Settings.VERSION has
-# been bumped.
+# Builds the UI's packages for Linux, Windows and macOS (software/ui/Scripts/PackageBuild.py) and the M4P board's
+# Marlin firmware (mcu), zips the CB1 board's server (mpu), and publishes them as a GitHub release tagged
+# v<Settings.VERSION>. Run it from the Actions tab once Settings.VERSION has been bumped.
 name: Release
 
 on:
@@ -32,7 +32,15 @@ jobs:
 
   app:
     needs: version
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Each builds the package for its own platform; macos-latest is Apple silicon.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: software/ui
     steps:
       - uses: actions/checkout@v5
 
@@ -41,20 +49,25 @@ jobs:
         with:
           python-version: "3.15"
 
-      - name: Recreate the UI's virtual environment
-        working-directory: software/ui
+      # The build reads the packages' versions from the lock, so only needs PyQt itself, which Settings imports.
+      - name: Install PyQt
         run: |
-          python -m venv .venv
-          .venv/bin/python -m pip install --no-cache-dir -r requirements-lock.txt
+          python - > "$RUNNER_TEMP/pyqt.txt" <<'EOF'
+          import json
+          packages = json.load(open("requirements-lock.json"))["packages"]
+          for name in packages:
+              if name.startswith("pyqt6"):
+                  print(f"{name}=={packages[name]}")
+          EOF
+          python -m pip install --no-cache-dir -r "$RUNNER_TEMP/pyqt.txt"
 
-      - name: Build the AppImage
-        working-directory: software/ui
-        run: .venv/bin/python Scripts/PackageBuild.py
+      - name: Build the package
+        run: python Scripts/PackageBuild.py
 
       - uses: actions/upload-artifact@v4
         with:
-          name: app
-          path: software/ui/Builds/LibreCardSorter-${{ needs.version.outputs.version }}-linux-x86_64.AppImage
+          name: app-${{ matrix.os }}
+          path: software/ui/Builds/LibreCardSorter-${{ needs.version.outputs.version }}-*
           if-no-files-found: error
 
   firmware:

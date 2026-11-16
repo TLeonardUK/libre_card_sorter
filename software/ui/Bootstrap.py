@@ -1,7 +1,7 @@
 # Libre Card Sorter
 # Copyright (C) 2026 Tim Leonard, All Rights Reserved
 
-# Run by a packaged build's launcher (AppRun) before Main.py. The package leaves out torch, its GPU libraries, the models and the
+# Run by Launch.py, in a packaged build, before Main.py. The package leaves out torch, its GPU libraries, the models and the
 # card database, as together they're several GB and which torch build a machine can use depends on its GPU, so they're
 # downloaded here on first run, as listed in setup/setup.json by the build. Exits with 0 once everything is in place.
 
@@ -20,8 +20,8 @@ from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget
 from Settings import Settings, RUNTIME_DIR, TRAINING_DIR
 
-# The package is read-only, so everything setup downloads goes in the runtime folder the launcher gives it, with the
-# packages in a folder the launcher puts on Python's path.
+# The package is read-only, so everything setup downloads goes in the runtime folder, with the packages in a folder
+# Launch.py puts on Python's path.
 PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETUP_DIR = os.path.join(PACKAGE_DIR, "setup")
 BUNDLED_WHEELS_DIR = os.path.join(SETUP_DIR, "wheels")
@@ -42,7 +42,7 @@ def load_setup():
 # Asks the NVIDIA driver directly, as torch isn't installed yet.
 def is_cuda_device_supported(driver_major_version, compute_capability):
     try:
-        cuda = ctypes.CDLL("libcuda.so.1")
+        cuda = ctypes.CDLL("nvcuda.dll" if (sys.platform == "win32") else "libcuda.so.1")
     except OSError:
         return False
 

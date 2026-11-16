@@ -10,17 +10,22 @@ from PyQt6.QtCore import QStandardPaths
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# A packaged build (see Scripts/PackageBuild.py) is read-only, so its launcher gives it a folder for what first-run
-# setup downloads, including the training folder's models and card database.
-RUNTIME_DIR = os.environ.get("LIBRE_CARD_SORTER_RUNTIME_DIR")
-TRAINING_DIR = os.path.join(RUNTIME_DIR, "training") if (RUNTIME_DIR) else os.path.join(BASE_DIR, "../training")
+# Bumped for each release; packaged builds are named after it.
+VERSION = "0.1.0"
+
 SAVE_DIR = os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation), "libre-card-sorter")
+
+# A packaged build (see Scripts/PackageBuild.py), which has its first-run setup's list of downloads beside the app, is
+# read-only, so setup downloads into a folder per version beside the app's settings, including the training folder's
+# models and card database.
+IS_PACKAGED = os.path.exists(os.path.join(BASE_DIR, "..", "setup", "setup.json"))
+RUNTIME_DIR = os.path.join(SAVE_DIR, "runtime", VERSION) if (IS_PACKAGED) else None
+TRAINING_DIR = os.path.join(RUNTIME_DIR, "training") if (IS_PACKAGED) else os.path.join(BASE_DIR, "../training")
 
 # Contains general global settings of the project
 class Settings:
 
-    # Version of the app, bumped for each release; packaged builds are named after it.
-    VERSION = "0.1.0"
+    VERSION = VERSION
 
     # CLIP model used to recognize cards
     CARD_INFERENCE_MODEL_PATH = os.path.abspath(os.path.join(TRAINING_DIR, "models/clip-vit-base-patch32"))
