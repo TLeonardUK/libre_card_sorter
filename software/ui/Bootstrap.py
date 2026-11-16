@@ -1,7 +1,7 @@
 # Libre Card Sorter
 # Copyright (C) 2026 Tim Leonard, All Rights Reserved
 
-# Run by a packaged build's launcher before Main.py. The package leaves out torch, its GPU libraries, the models and the
+# Run by a packaged build's launcher (AppRun) before Main.py. The package leaves out torch, its GPU libraries, the models and the
 # card database, as together they're several GB and which torch build a machine can use depends on its GPU, so they're
 # downloaded here on first run, as listed in setup/setup.json by the build. Exits with 0 once everything is in place.
 
@@ -18,12 +18,16 @@ import urllib.request
 from PyQt6.QtCore import QProcess
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget
-from Settings import Settings, TRAINING_DIR
+from Settings import Settings, RUNTIME_DIR, TRAINING_DIR
 
+# The package is read-only, so everything setup downloads goes in the runtime folder the launcher gives it, with the
+# packages in a folder the launcher puts on Python's path.
 PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETUP_DIR = os.path.join(PACKAGE_DIR, "setup")
-WHEELS_DIR = os.path.join(SETUP_DIR, "wheels")
-PACKAGES_INSTALLED_PATH = os.path.join(PACKAGE_DIR, "python", "packages_installed")
+BUNDLED_WHEELS_DIR = os.path.join(SETUP_DIR, "wheels")
+DOWNLOADED_WHEELS_DIR = os.path.join(RUNTIME_DIR, "wheels")
+PACKAGES_DIR = os.path.join(RUNTIME_DIR, "packages")
+PACKAGES_INSTALLED_PATH = os.path.join(RUNTIME_DIR, "packages_installed")
 
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
@@ -111,21 +115,23 @@ def download_files(files, paths):
         done += file["size"]
         print(f"Progress {done} of {total}")
 
-def download_packages(setup):
-    wheels = choose_variant(setup)["wheels"]
+# Wheels the package ships (built by the build, having none to download) are in the package; the rest are downloaded.
+def wheel_paths(setup):
     paths = []
-    for wheel in wheels:
-        paths.append(os.path.join(WHEELS_DIR, wheel["name"]))
-    download_files(wheels, paths)
+    for wheel in choose_variant(setup)["wheels"]:
+        paths.append(os.path.join(DOWNLOADED_WHEELS_DIR if ("url" in wheel) else BUNDLED_WHEELS_DIR, wheel["name"]))
+    return paths
+
+def download_packages(setup):
+    download_files(choose_variant(setup)["wheels"], wheel_paths(setup))
 
 def install_packages(setup):
-    arguments = [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", "--disable-pip-version-check", "--no-warn-script-location"]
-    for wheel in choose_variant(setup)["wheels"]:
-        arguments.append(os.path.join(WHEELS_DIR, wheel["name"]))
-    subprocess.run(arguments, check=True)
+    # --upgrade replaces what an interrupted install left, rather than skipping it.
+    arguments = [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", "--upgrade", "--target", PACKAGES_DIR, "--disable-pip-version-check", "--no-warn-script-location"]
+    subprocess.run(arguments + wheel_paths(setup), check=True)
     with open(PACKAGES_INSTALLED_PATH, "w") as file:
         file.write("")
-    shutil.rmtree(WHEELS_DIR)
+    shutil.rmtree(DOWNLOADED_WHEELS_DIR)
 
 # Always the latest database on the repository's main branch; its Git LFS pointer there gives its hash and size.
 def download_database(setup):

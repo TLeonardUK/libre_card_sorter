@@ -1,5 +1,6 @@
-# Builds the UI's package (software/ui/Scripts/PackageBuild.py) and publishes it as a GitHub release tagged
-# v<Settings.VERSION>. Run it from the Actions tab once Settings.VERSION has been bumped.
+# Builds the UI's AppImage (software/ui/Scripts/PackageBuild.py) and the M4P board's Marlin firmware (mcu), zips the
+# CB1 board's server (mpu), and publishes them as a GitHub release tagged v<Settings.VERSION>. Run it from the Actions tab once Settings.VERSION has
+# been bumped.
 name: Release
 
 on:
@@ -9,15 +10,12 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
-
-      # Must match the Python version the package's runtime and pinned packages are for.
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.15"
 
       - name: Check the version hasn't been released
         id: version
@@ -32,19 +30,76 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  app:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Must match the Python version the package's runtime and pinned packages are for.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.15"
+
       - name: Recreate the UI's virtual environment
         working-directory: software/ui
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --no-cache-dir -r requirements-lock.txt
 
-      - name: Build the package
+      - name: Build the AppImage
         working-directory: software/ui
         run: .venv/bin/python Scripts/PackageBuild.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: software/ui/Builds/LibreCardSorter-${{ needs.version.outputs.version }}-linux-x86_64.AppImage
+          if-no-files-found: error
+
+  firmware:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install PlatformIO
+        run: python -m pip install --no-cache-dir platformio==6.2.0
+
+      - name: Build the firmware
+        working-directory: mcu
+        run: |
+          pio run -e STM32G0B1RE_manta_btt
+          cp .pio/build/STM32G0B1RE_manta_btt/firmware.bin "LibreCardSorter-${{ needs.version.outputs.version }}-btt-manta-m4p-firmware.bin"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: mcu/LibreCardSorter-${{ needs.version.outputs.version }}-btt-manta-m4p-firmware.bin
+          if-no-files-found: error
+
+  release:
+    needs: [version, app, firmware]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Zip the CB1 server
+        working-directory: mpu
+        run: zip "../release/LibreCardSorter-${{ needs.version.outputs.version }}-btt-cb1-firmware.zip" server.py
 
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version=${{ steps.version.outputs.version }}
-          gh release create "v$version" "software/ui/Builds/$version.zip" --target "$GITHUB_SHA" --title "Libre Card Sorter $version" --generate-notes
+          version=${{ needs.version.outputs.version }}
+          gh release create "v$version" release/* --target "$GITHUB_SHA" --title "Libre Card Sorter $version" --generate-notes

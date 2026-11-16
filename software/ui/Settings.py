@@ -8,9 +8,12 @@ import pickle
 from pathlib import Path
 from PyQt6.QtCore import QStandardPaths
 
-# A packaged build (see Scripts/PackageBuild.py) has the same layout, with the app beside a training folder.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TRAINING_DIR = os.path.join(BASE_DIR, "../training")
+
+# A packaged build (see Scripts/PackageBuild.py) is read-only, so its launcher gives it a folder for what first-run
+# setup downloads, including the training folder's models and card database.
+RUNTIME_DIR = os.environ.get("LIBRE_CARD_SORTER_RUNTIME_DIR")
+TRAINING_DIR = os.path.join(RUNTIME_DIR, "training") if (RUNTIME_DIR) else os.path.join(BASE_DIR, "../training")
 SAVE_DIR = os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation), "libre-card-sorter")
 
 # Contains general global settings of the project

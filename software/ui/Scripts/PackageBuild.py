@@ -1,10 +1,11 @@
 # Libre Card Sorter
 # Copyright (C) 2026 Tim Leonard, All Rights Reserved
 
-# Packages the UI into a standalone folder, Builds/<version>/, that runs without Python or the repository. The version
-# is Settings.VERSION. The package holds a Python runtime with only PyQt installed and the app; Bootstrap.py downloads
-# the rest on first run: pinned versions of what's installed in the UI's virtual environment, so it must be run with
-# that, the models, and the latest card database on the main branch of the repository's GitHub remote:
+# Packages the UI into an AppImage, Builds/LibreCardSorter-<version>-linux-x86_64.AppImage, that runs without Python or the
+# repository, leaving the folder it's made from in Builds/<version>/. The version is Settings.VERSION. The package holds
+# a Python runtime with only PyQt installed and the app; Bootstrap.py downloads the rest on first run: pinned versions
+# of what's installed in the UI's virtual environment, so it must be run with that, the models, and the latest card
+# database on the main branch of the repository's GitHub remote:
 #
 #   cd software/ui
 #   .venv/bin/python Scripts/PackageBuild.py
@@ -320,45 +321,55 @@ def prune_qt(site_packages_dir):
         if (name not in needed):
             remove_path(os.path.join(lib_dir, name))
 
-LAUNCHER = """#!/bin/sh
-# Runs first-run setup, which downloads what the package leaves out, then the app. Python is kept to the package's own
-# packages, not the user's (~/.local) or PYTHONPATH, which setup's steps and pip inherit.
-DIR="$(dirname "$(readlink -f "$0")")"
-unset PYTHONPATH PYTHONHOME
+APPIMAGETOOL_URL = "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+
+# The AppImage's launcher. The AppImage is read-only, so setup downloads into a folder per version in the user's data
+# folder (where the app keeps its settings), whose packages folder goes on Python's path. Python is otherwise kept to
+# the package's own packages, not the user's (~/.local) or PYTHONPATH; setup's steps and pip inherit all this.
+APP_RUN = """#!/bin/sh
+HERE="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+RUNTIME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/libre-card-sorter/runtime/{version}"
+unset PYTHONHOME
 export PYTHONNOUSERSITE=1
-"$DIR/python/bin/python3" "$DIR/app/Bootstrap.py" && exec "$DIR/python/bin/python3" "$DIR/app/Main.py" "$@"
+export PYTHONPATH="$RUNTIME_DIR/packages"
+export LIBRE_CARD_SORTER_RUNTIME_DIR="$RUNTIME_DIR"
+"$HERE/python/bin/python3" "$HERE/app/Bootstrap.py" && exec "$HERE/python/bin/python3" "$HERE/app/Main.py" "$@"
 """
 
-def write_launcher(app_dir):
-    path = os.path.join(app_dir, APP_NAME)
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Name=Libre Card Sorter
+Exec=AppRun
+Icon=libre-card-sorter
+Categories=Utility;
+Terminal=false
+"""
+
+def write_executable(path, text):
     with open(path, "w") as file:
-        file.write(LAUNCHER)
+        file.write(text)
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-# The zip sits beside the build's folder, named the same, and holds that folder.
-def zip_build(build_dir):
-    zip_path = f"{build_dir}.zip"
-    print(f"Zipping to {zip_path}")
-    if (os.path.exists(zip_path)):
-        os.remove(zip_path)
-    shutil.make_archive(build_dir, "zip", root_dir=os.path.dirname(build_dir), base_dir=os.path.basename(build_dir))
-    print(f"Zipped to {zip_path}")
+def write_app_dir_files(app_dir):
+    write_executable(os.path.join(app_dir, "AppRun"), APP_RUN.replace("{version}", Settings.VERSION))
+    with open(os.path.join(app_dir, "libre-card-sorter.desktop"), "w") as file:
+        file.write(DESKTOP_ENTRY)
+    shutil.copy2(Settings.APP_ICON_PATH, os.path.join(app_dir, "libre-card-sorter.svg"))
+    os.symlink("libre-card-sorter.svg", os.path.join(app_dir, ".DirIcon"))
+
+def build_app_image(app_dir, app_image_path):
+    print(f"Building {app_image_path}")
+    with tempfile.TemporaryDirectory() as tool_dir:
+        tool_path = os.path.join(tool_dir, "appimagetool")
+        urllib.request.urlretrieve(APPIMAGETOOL_URL, tool_path)
+        os.chmod(tool_path, stat.S_IRWXU)
+        # Extracted rather than mounted, as FUSE isn't available everywhere it's built (e.g. GitHub's runners).
+        subprocess.run([tool_path, app_dir, app_image_path], env=dict(os.environ, APPIMAGE_EXTRACT_AND_RUN="1", ARCH="x86_64"), check=True)
 
 def main():
-    parser = argparse.ArgumentParser(description="Packages the UI into a standalone build.")
+    parser = argparse.ArgumentParser(description="Packages the UI into an AppImage.")
     parser.add_argument("--force", action="store_true", help="Replace an existing build of this version.")
-    parser.add_argument("--no-zip", action="store_true", help="Skip zipping the build, e.g. to try it out first.")
-    parser.add_argument("--zip-only", action="store_true", help="Zip an existing build of this version (e.g. one built with --no-zip) without rebuilding it.")
     args = parser.parse_args()
-
-    build_dir = os.path.join(UI_DIR, "Builds", Settings.VERSION)
-    zip_path = f"{build_dir}.zip"
-    if (args.zip_only):
-        if (not os.path.isdir(build_dir)):
-            print(f"There's no build of version {Settings.VERSION} in {os.path.dirname(build_dir)} to zip.")
-            return 1
-        zip_build(build_dir)
-        return 0
 
     if (sys.platform != "linux" or platform.machine() != "x86_64"):
         print("Only x86-64 Linux builds are supported so far.")
@@ -367,16 +378,18 @@ def main():
         print(f"The virtual environment runs Python {sys.version_info[0]}.{sys.version_info[1]}, but PYTHON_RUNTIME_URL is for {PYTHON_RUNTIME_VERSION[0]}.{PYTHON_RUNTIME_VERSION[1]}; update PYTHON_RUNTIME_URL to match.")
         return 1
 
-    if (os.path.exists(build_dir) or os.path.exists(zip_path)):
+    build_dir = os.path.join(UI_DIR, "Builds", Settings.VERSION)
+    app_image_path = os.path.join(UI_DIR, "Builds", f"{APP_NAME}-{Settings.VERSION}-linux-x86_64.AppImage")
+    if (os.path.exists(build_dir) or os.path.exists(app_image_path)):
         if (not args.force):
             print(f"A build of version {Settings.VERSION} already exists in {os.path.dirname(build_dir)}. Bump Settings.VERSION, or pass --force to replace it.")
             return 1
         if (os.path.exists(build_dir)):
             shutil.rmtree(build_dir)
-        if (os.path.exists(zip_path)):
-            os.remove(zip_path)
+        if (os.path.exists(app_image_path)):
+            os.remove(app_image_path)
 
-    app_dir = os.path.join(build_dir, APP_NAME)
+    app_dir = os.path.join(build_dir, f"{APP_NAME}.AppDir")
     setup_dir = os.path.join(app_dir, "setup")
     os.makedirs(setup_dir)
     install_python_runtime(app_dir)
@@ -395,12 +408,14 @@ def main():
     prune_qt(site_packages_dir)
     write_setup(setup_dir, python, packages)
 
-    shutil.copytree(UI_DIR, os.path.join(app_dir, "app"), ignore=shutil.ignore_patterns(*NON_APP_FILES))
-    write_launcher(app_dir)
+    app_source_dir = os.path.join(app_dir, "app")
+    shutil.copytree(UI_DIR, app_source_dir, ignore=shutil.ignore_patterns(*NON_APP_FILES))
+    # Compiled now, as Python can't save its compiled copies into the read-only AppImage, so would redo it each run.
+    run_runtime_python([python, "-m", "compileall", "-q", app_source_dir])
+    write_app_dir_files(app_dir)
 
-    print(f"Built version {Settings.VERSION} in {app_dir}")
-    if (not args.no_zip):
-        zip_build(build_dir)
+    build_app_image(app_dir, app_image_path)
+    print(f"Built {app_image_path}")
     return 0
 
 if __name__ == "__main__":
