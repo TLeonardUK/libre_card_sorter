@@ -17,3 +17,9 @@ logs/
 
 # packaged UI builds (software/ui/Scripts/PackageBuild.py)
 software/ui/Builds/
+
+# kept locally, not part of the repository
+.claude/
+old/
+mcu/.github/
+mcu/.devcontainer/
