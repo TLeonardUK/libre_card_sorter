@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cu134
+transformers
+requests
+pyqt6
+pillow
+websockets
+numpy
+torch 
+torchvision 

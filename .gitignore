@@ -1,0 +1,19 @@
+# ignore app cache folder
+.cache/
+__pycache__/
+.vscode/
+images/
+full_images/
+ocr_images/
+webcam_images/
+webcam_images_*/
+cache/
+*.jsonl
+*.pyc
+*dataset.db
+!software/training/dataset.db
+logs/
+**/clip-finetuned/checkpoint_latest/
+
+# packaged UI builds (software/ui/Scripts/PackageBuild.py)
+software/ui/Builds/
