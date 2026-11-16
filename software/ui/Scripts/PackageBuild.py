@@ -52,8 +52,8 @@ LOCK_PATH = os.path.join(UI_DIR, "requirements-lock.txt")
 QT_PLUGIN_DIRS = ["egldeviceintegrations", "generic", "iconengines", "imageformats", "platforminputcontexts", "platforms", "platformthemes", "wayland-decoration-client", "wayland-graphics-integration-client", "wayland-shell-integration", "xcbglintegrations"]
 
 # Runs the package's Python as the launcher does, seeing only its own packages, not the user's (~/.local) or PYTHONPATH.
-def run_runtime_python(arguments, **options):
-    environment = dict(os.environ, PYTHONNOUSERSITE="1")
+def run_runtime_python(arguments, environment_overrides={}, **options):
+    environment = dict(os.environ, PYTHONNOUSERSITE="1", **environment_overrides)
     environment.pop("PYTHONPATH", None)
     environment.pop("PYTHONHOME", None)
     return subprocess.run(arguments, env=environment, check=True, **options)
@@ -107,6 +107,10 @@ def write_requirements(path, index_url, packages):
         for name in sorted(packages, key=str.lower):
             file.write(f"{name}=={packages[name]}\n")
 
+# Builds packages without their optional compiled extensions, which would be built against the build machine's
+# libraries (e.g. PyYAML's against libyaml, which GitHub's runners have), so may not run on the users'.
+WHEEL_BUILD_ENVIRONMENT = {"PYYAML_FORCE_LIBYAML": "0"}
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as file:
@@ -135,7 +139,7 @@ def resolve_wheels(python, index_url, packages, wheels_dir):
             continue
 
         with tempfile.TemporaryDirectory() as build_dir:
-            run_runtime_python([python, "-m", "pip", "wheel", "--no-deps", "--quiet", "--disable-pip-version-check", "--wheel-dir", build_dir, url])
+            run_runtime_python([python, "-m", "pip", "wheel", "--no-deps", "--quiet", "--disable-pip-version-check", "--wheel-dir", build_dir, url], WHEEL_BUILD_ENVIRONMENT)
             name = os.listdir(build_dir)[0]
             os.makedirs(wheels_dir, exist_ok=True)
             # Kept from the first variant that needs it, as a rebuild needn't be byte-identical to match its hash.
