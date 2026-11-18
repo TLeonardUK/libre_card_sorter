@@ -51,6 +51,7 @@ class Settings:
     FIELD_DESCRIPTION = {
         "card_sorter_ip_address":                           "IP address of the card sorter.",
         "connection_port":                                  "Port the card sorter's server listens on.",
+        "persistent_card_list":                             "Keeps the Status tab's card list between workflow runs and between runs of the program, rather than clearing it when a workflow starts.",
         "auto_connect":                                     "Connects to the card sorter on startup and keeps retrying, waiting up to 30 seconds between attempts, until connected or Disconnect is clicked.",
         "card_probability_confidence_gap":                  "Difference between the best and second best scored card that represents full confidence.",
         "card_probability_unknown_confidence_threshold":    "Any identified card with a confidence below this is considered unknown.",
@@ -104,6 +105,7 @@ class Settings:
         ("Y Axis",              ["y_feed_rate", "y_max_feed_rate", "y_max_acceleration", "y_axis_range", "y_load_approach_distance", "y_dispense_card_backoff_distance", "card_thickness"]),
         ("Z Axis",              ["z_feed_rate", "z_max_feed_rate", "z_max_acceleration", "z_dispense_grip_card_distance", "z_dispense_feed_card_distance", "z_park_distance"]),
         ("Webcam",              ["webcam_exposure", "webcam_focus", "webcam_white_balance", "webcam_brightness", "webcam_crop_left", "webcam_crop_right", "webcam_crop_top", "webcam_crop_bottom"]),
+        ("Card List",           ["persistent_card_list"]),
         ("Debugging",           ["verbose"]),
     ]
 
@@ -111,6 +113,10 @@ class Settings:
 
         # Workflows the user has configured
         self.workflows = [ ]
+
+        # The Status tab's card list, as (CardInfo, is foil, quantity, bin index), kept while persistent_card_list is set.
+        self.saved_card_list = [ ]
+        self.persistent_card_list = True
 
         self.card_sorter_ip_address = "10.69.40.10"
         self.card_probability_confidence_gap = 0.03
@@ -125,13 +131,13 @@ class Settings:
 
         self.x_feed_rate = 42000
         self.y_feed_rate = 15000#
-        self.z_feed_rate = 15000
+        self.z_feed_rate = 10000
         self.x_max_feed_rate = 700
         self.y_max_feed_rate = 60
         self.z_max_feed_rate = 20000
         self.x_max_acceleration = 8000
         self.y_max_acceleration = 2000
-        self.z_max_acceleration = 2000
+        self.z_max_acceleration = 1000
         self.acceleration = 8000
         self.x_load_position = 75
         self.bin_count = 7
@@ -141,16 +147,16 @@ class Settings:
         self.y_axis_range = 271.5
         self.card_thickness = 0.31
 
-        self.z_dispense_grip_card_distance = 50
-        self.z_dispense_feed_card_distance = 300
-        self.y_dispense_card_backoff_distance = -40
+        self.z_dispense_grip_card_distance = 40
+        self.z_dispense_feed_card_distance = 110
+        self.y_dispense_card_backoff_distance = -20
         self.y_load_approach_distance = 2
         self.z_park_distance = 35
 
         self.webcam_crop_left = 0.2925
-        self.webcam_crop_right = 0.8
-        self.webcam_crop_top = 0.025
-        self.webcam_crop_bottom = 0.992
+        self.webcam_crop_right = 0.78
+        self.webcam_crop_top = 0.04
+        self.webcam_crop_bottom = 0.96
         self.webcam_exposure = 200
         self.webcam_brightness = 255
         self.webcam_focus = 64

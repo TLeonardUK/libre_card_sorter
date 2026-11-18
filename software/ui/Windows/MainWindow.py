@@ -6,9 +6,9 @@ import sys
 import time
 
 from Sorting.CardSorting import CardSorter, CardSorterState, CardSorterNotIdleException
-from Sorting.CardIdentification import CardIdentifier, CardSource, get_card_image_path
+from Sorting.CardIdentification import CardIdentifier, CardIdentity, CardSource, get_card_image_path
 from Workflow.Workflows import Workflow, WorkflowBin, WorkflowCardArchetype, WorkflowCardArchetypeRule, WorkflowCardArchetypeRuleOperator, WorkflowMatchBehaviour, WorkflowExecutionState
-from Workflow.WorkflowExecution import WorkflowExecutor, WorkflowExecutorRunState, WorkflowExecutorInvalidStateException
+from Workflow.WorkflowExecution import CardList, WorkflowExecutor, WorkflowExecutorRunState, WorkflowExecutorInvalidStateException
 from Settings import Settings
 from Sorting.CardSchema import CardBoolean, CardFieldName, CardRarity
 
@@ -57,7 +57,8 @@ from PyQt6.QtWidgets import (
     QToolButton,
     QHeaderView,
     QMenu,
-    QFileDialog
+    QFileDialog,
+    QCheckBox
 )
 
 class CardListTreeWidgetItem(QTreeWidgetItem):
@@ -105,6 +106,15 @@ class MainWindow(QMainWindow):
         self.card_identifier = CardIdentifier(self.settings)
         self.workflow_executor = None
         self.workflow = None
+        self.card_list = CardList()
+        for saved_entry in self.settings.saved_card_list:
+            identity = CardIdentity()
+            identity.info = saved_entry[0]
+            identity.is_foil = saved_entry[1]
+            # Lists saved before bins were recorded have no bin index.
+            bin_index = saved_entry[3] if len(saved_entry) > 3 else None
+            self.card_list.add(identity, bin_index, saved_entry[2])
+        self.saved_card_list_revision = self.card_list.get_revision()
 
         for child in CardSource.__subclasses__():
             source = child()
@@ -401,25 +411,36 @@ class MainWindow(QMainWindow):
         
         # Card List view ----------------------------------
         self.card_list_tree_widget = QTreeWidget(self)
-        self.card_list_tree_widget.setColumnCount(5)
-        self.card_list_tree_widget.setHeaderLabels([ "Card", "Rarity", "Foil", "Quantity", "Price" ])
+        self.card_list_tree_widget.setColumnCount(6)
+        self.card_list_tree_widget.setHeaderLabels([ "Card", "Rarity", "Foil", "Quantity", "Price", "Bin" ])
         self.card_list_tree_widget.setColumnWidth(0, 280)
         self.card_list_tree_widget.setColumnWidth(1, 85)
         self.card_list_tree_widget.setColumnWidth(2, 75)
         self.card_list_tree_widget.setColumnWidth(3, 75)
         self.card_list_tree_widget.setColumnWidth(4, 75)
+        self.card_list_tree_widget.setColumnWidth(5, 50)
 
         self.export_csv_button = QPushButton("Export CSV")
         self.export_csv_button.clicked.connect(self.__export_csv_clicked)
+
+        self.clear_card_list_button = QPushButton("Clear")
+        self.clear_card_list_button.clicked.connect(self.__clear_card_list_clicked)
+
+        self.persistent_card_list_checkbox = QCheckBox("Persistent")
+        self.persistent_card_list_checkbox.setChecked(self.settings.persistent_card_list)
+        self.persistent_card_list_checkbox.toggled.connect(self.__persistent_card_list_toggled)
 
         self.total_cards_label = QLabel("Total Cards: 0")
         self.total_card_price_label = QLabel("Total Card Price: $0.00")
 
         card_list_footer_layout = QHBoxLayout()
+        card_list_footer_layout.addSpacing(6)
         card_list_footer_layout.addWidget(self.total_cards_label)
         card_list_footer_layout.addSpacing(20)
         card_list_footer_layout.addWidget(self.total_card_price_label)
         card_list_footer_layout.addStretch()
+        card_list_footer_layout.addWidget(self.persistent_card_list_checkbox)
+        card_list_footer_layout.addWidget(self.clear_card_list_button)
         card_list_footer_layout.addWidget(self.export_csv_button)
 
         card_list_widget = QWidget(self)
@@ -1060,12 +1081,13 @@ class MainWindow(QMainWindow):
             count_label = self.bin_card_count_labels[i]
             bin_label = self.bin_labels[i]
             
-            if (self.workflow_executor != None):                
+            workflow = None if self.workflow_executor == None else self.workflow_executor.get_workflow()
+            if (workflow != None and i < len(workflow.bins)):
                 card_count = self.workflow_executor.get_bin_card_count(i)
                 card_capacity = self.workflow_executor.get_bin_card_capacity(i)
-                workflow = self.workflow_executor.get_workflow()
-                
-                progress_bar.setValue(int((float(card_count) / float(card_capacity)) * 100))
+
+                # A capacity of 0 means the bin never fills.
+                progress_bar.setValue(int((float(card_count) / float(card_capacity)) * 100) if card_capacity > 0 else 0)
                 count_label.setText(f"{card_count}")
                 bin_label.setText(f"{workflow.bins[i].name}")
             else:
@@ -1295,13 +1317,13 @@ class MainWindow(QMainWindow):
         self.project_tree_widget.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
 
     def __update_card_list(self):
-        if (self.workflow_executor == None):
-            return
+        if (self.settings.persistent_card_list and self.card_list.get_revision() != self.saved_card_list_revision):
+            self.__save_card_list()
 
         root_widget = self.card_list_tree_widget.invisibleRootItem()
 
         # Update / Add existing widgets
-        card_list = self.workflow_executor.get_card_list()
+        card_list = self.card_list.get_entries()
         total_cards = 0
         total_price = 0.0
         for entry in card_list:
@@ -1313,7 +1335,8 @@ class MainWindow(QMainWindow):
                 child = root_widget.child(i)
                 child_entry = child.entry
                 if (entry.card_identity.is_foil == child_entry.card_identity.is_foil and 
-                    entry.card_identity.info.id == child_entry.card_identity.info.id):               
+                    entry.card_identity.info.id == child_entry.card_identity.info.id and
+                    entry.bin_index == child_entry.bin_index):               
                     child.setText(3, str(entry.quantity))
                     exists = True
                     
@@ -1325,6 +1348,7 @@ class MainWindow(QMainWindow):
                 item.setText(2, "Foil" if entry.card_identity.is_foil else "Normal")
                 item.setText(3, str(entry.quantity))
                 item.setText(4, "$" + str(entry.card_identity.info.attributes[CardFieldName.PRICE_USD_FOIL] if entry.card_identity.is_foil else entry.card_identity.info.attributes[CardFieldName.PRICE_USD_NONFOIL]))
+                item.setText(5, "" if entry.bin_index == None else str(entry.bin_index + 1))
 
                 image_url = QUrl.fromLocalFile(get_card_image_path(entry.card_identity.info.id)).toString()
                 for column in range(self.card_list_tree_widget.columnCount()):
@@ -1341,13 +1365,30 @@ class MainWindow(QMainWindow):
             exists = False
             for entry in card_list:
                 if (entry.card_identity.is_foil == child_entry.card_identity.is_foil and 
-                    entry.card_identity.info.id == child_entry.card_identity.info.id):               
+                    entry.card_identity.info.id == child_entry.card_identity.info.id and
+                    entry.bin_index == child_entry.bin_index):               
                     exists = True
                     break
             if (not exists):
                 root_widget.removeChild(child)
             else:
                 i += 1
+
+    def __clear_card_list_clicked(self, s):
+        self.card_list.clear()
+
+    def __persistent_card_list_toggled(self, checked):
+        self.settings.persistent_card_list = checked
+        self.__save_card_list()
+
+    # Only what's needed to list each card is saved, as identities also carry the full size preview image.
+    def __save_card_list(self):
+        self.saved_card_list_revision = self.card_list.get_revision()
+        self.settings.saved_card_list = []
+        if (self.settings.persistent_card_list):
+            for entry in self.card_list.get_entries():
+                self.settings.saved_card_list.append((entry.card_identity.info, entry.card_identity.is_foil, entry.quantity, entry.bin_index))
+        self.settings.save()
 
     def __export_csv_clicked(self, s):
         path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "cards.csv", "CSV Files (*.csv)")
@@ -1439,7 +1480,9 @@ class MainWindow(QMainWindow):
         self.__set_live_preview(False, turn_light_off=False)
         self.__queued_device_operations = []
         self.__discard_workflow_executor()
-        self.workflow_executor = WorkflowExecutor(self.card_sorter, self.card_identifier, self.settings)
+        if (not self.settings.persistent_card_list):
+            self.card_list.clear()
+        self.workflow_executor = WorkflowExecutor(self.card_sorter, self.card_identifier, self.settings, self.card_list)
         self.workflow_executor.start(selected_workflow)
         self.__update_state()
         self.main_layout.setCurrentIndex(1)
@@ -1482,6 +1525,11 @@ class MainWindow(QMainWindow):
         SettingsWindow(self.settings, self).exec()
 
         self.ip_line_edit.setText(self.settings.card_sorter_ip_address)
+
+        self.persistent_card_list_checkbox.blockSignals(True)
+        self.persistent_card_list_checkbox.setChecked(self.settings.persistent_card_list)
+        self.persistent_card_list_checkbox.blockSignals(False)
+        self.__save_card_list()
 
         mirrored_line_edits = [
             (self.left_crop_line_edit, self.settings.webcam_crop_left),

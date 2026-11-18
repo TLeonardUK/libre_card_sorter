@@ -31,14 +31,50 @@ class WorkflowAbortedException(Exception):
 class CardListEntry:
     def __init__(self):
         self.card_identity = None
+        self.bin_index = None
         self.quantity = 0
+
+# Running list of the cards processed, owned by the UI rather than an executor so it can outlive a workflow run.
+class CardList:
+    def __init__(self):
+        self.__entries = []
+        self.__lock = Lock()
+        self.__revision = 0
+
+    def add(self, card_identity, bin_index, quantity):
+        with self.__lock:
+            self.__revision += 1
+            for entry in self.__entries:
+                if (entry.card_identity.info.id == card_identity.info.id and entry.card_identity.is_foil == card_identity.is_foil and entry.bin_index == bin_index):
+                    entry.quantity += quantity
+                    return
+
+            entry = CardListEntry()
+            entry.card_identity = card_identity
+            entry.bin_index = bin_index
+            entry.quantity = quantity
+            self.__entries.append(entry)
+
+    # Changes whenever the list does, so it's only saved when needed.
+    def get_revision(self):
+        with self.__lock:
+            return self.__revision
+
+    def get_entries(self):
+        with self.__lock:
+            return self.__entries.copy()
+
+    def clear(self):
+        with self.__lock:
+            self.__revision += 1
+            self.__entries = []
 
 # This class is responsible for driving a card sorter from the rules
 # setout in a workflow. This is the main class that the UI itself interacts with.
 # Execution is performed on a seperate thread to avoid blocking the UI at any point.
 class WorkflowExecutor:
 
-    def __init__(self, card_sorter, card_identifier, settings):        
+    def __init__(self, card_sorter, card_identifier, settings, card_list):        
         self.__card_sorter = card_sorter
         self.__settings = settings
         self.__card_identifier = card_identifier
@@ -54,8 +90,7 @@ class WorkflowExecutor:
         self.__identifying_card = False
         self.__identifying_card_foil = False
         self.__last_card_identity = CardIdentity()
-        self.__card_list = []
-        self.__card_list_lock = Lock()
+        self.__card_list = card_list
         self.__card_cycle_durations = []
         self.__process_thread = Thread(target = self.__thread_entry, daemon = True)
         self.__process_thread.start()
@@ -111,24 +146,11 @@ class WorkflowExecutor:
             self.__identifying_card_foil = False
 
 
-    def __track_card(self, card_identity):
+    def __track_card(self, card_identity, bin_index):
         if (card_identity == None):
             return
-        
-        with self.__card_list_lock:
-            for entry in self.__card_list:
-                if (entry.card_identity.info.id == card_identity.info.id and entry.card_identity.is_foil == card_identity.is_foil):
-                    entry.quantity += 1
-                    return 
-                
-            entry = CardListEntry()
-            entry.card_identity = card_identity
-            entry.quantity = 1
-            self.__card_list.append(entry)
-    
-    def get_card_list(self):
-        with self.__card_list_lock:
-            return self.__card_list.copy()
+
+        self.__card_list.add(card_identity, bin_index, 1)
 
     def get_cards_per_minute(self):
         durations = self.__card_cycle_durations
@@ -221,7 +243,7 @@ class WorkflowExecutor:
         self.__identifying_card = False
         self.__last_card_identity = card_identity
         
-        self.__track_card(card_identity)
+        self.__track_card(card_identity, target_bin_index)
         
         # Deliver the card to the selected bin.
         self.__run_sorter_operation(self.__card_sorter.deliver_card_to_bin, target_bin_index)

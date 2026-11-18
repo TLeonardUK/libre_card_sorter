@@ -385,6 +385,11 @@ exit_nip_pad_clearance = 0.1;
 // comes from this length and thickness. It's a separate part so it prints without overhangs, layers running along it.
 exit_nip_tongue_flex_length = 7.5;
 exit_nip_tongue_thickness = 0.7;
+// The flexing section is slotted along the card's travel into ribs, as at full width it pressed the roller onto the pad hard
+// enough that their rubbing, whenever no card was between them, stalled the motor. Stiffness goes with the ribs' total width;
+// a card's edge always spans the slots, resting on the ribs either side.
+exit_nip_tongue_rib_count = 3;
+exit_nip_tongue_rib_width = 2.5;
 exit_nip_tongue_wall = 1.5;
 // Wide enough to stay clear of the insert wherever it sits in its pocket.
 exit_nip_tongue_slot = 1;
@@ -534,8 +539,10 @@ swing_idler_boss_radius = swing_idler_nut_radius + 1.2;
 swing_hub_radius = 7;
 // Long enough to fit the insert, with solid walls either side, past the clamp's chamfer.
 swing_sun_hub_length = 10;
-// Close, since it's clamped rather than running and any offset in it makes the sun gear run eccentric.
+// Close, since it's clamped rather than running and any offset in it makes the nip roller run eccentric.
 swing_sun_bore_radius = swing_rod_radius + 0.1;
+// The clamped gears printed too tight at the roller's bore to slide onto their rods; the grub screw still clamps them.
+swing_gear_bore_radius = swing_rod_radius + 0.25;
 swing_sun_clamp_radius = swing_rod_radius + exit_threaded_insert_depth + 0.5;
 // The clamp reaches past the roller gear's tips as the arm swings, so it starts back from the gear face.
 swing_sun_clamp_gap = 1;
@@ -1016,6 +1023,15 @@ exit_nip_bolt_y = exit_nip_tongue_half_width - exit_nip_bolt_inset;
 // than the preload; its axle stays where a full-size grip would give the preload.
 nip_roller_grip_reduction = 1;
 nip_roller_radius = swing_roller_radius + swing_roller_cast_grip_thickness - nip_roller_grip_reduction;
+// Geared up so the nip roller's surface outruns the swing roller's (measured at 22 and 23.5mm across) whatever the casting
+// variation, as one holding the card back stalled the motor; outrunning it only slides the card under the swing roller. Both
+// gears are profile shifted to mesh at the idler's existing spacing, the nip gear's tips raised to keep the contact ratio.
+nip_drive_gear_teeth = 15;
+nip_drive_gear_profile_shift = -0.5;
+nip_drive_gear_addendum = 0.5;
+nip_gear_teeth = 13;
+nip_gear_profile_shift = 0.5;
+nip_gear_addendum = 1.2;
 nip_center = [exit_nip_x, exit_insert_lip_height + nip_roller_radius + nip_roller_grip_reduction - exit_nip_preload];
 // The pad pushes the axle up against the tops of its bearings.
 nip_bearing_center = nip_center - [0, swing_support_clearance_radius - swing_rod_radius];
@@ -1024,8 +1040,12 @@ nip_idler_center = swing_elbow(nip_center, swing_shaft, swing_gear_centre_distan
 nip_idler_counterbore_depth = nip_idler_shoulder_length - swing_gear_thickness - (swing_idler_end_play * 2);
 nip_gear_y = [swing_idle_support_y[1] + swing_idler_end_play, swing_idle_support_y[1] + swing_idler_end_play + swing_gear_thickness];
 nip_hub_end_y = nip_gear_y[1] + swing_sun_hub_length;
-nip_idler_phase = swing_mesh_phase(swing_shaft, nip_idler_center, 0);
-nip_gear_phase = swing_mesh_phase(nip_idler_center, nip_center, nip_idler_phase);
+nip_clamp_start_y = nip_gear_y[1] + swing_sun_clamp_gap;
+// The drive gear's clamp sits beyond the nip gear's hub, as the two turn at different speeds and their clamps would meet.
+nip_drive_clamp_start_y = nip_hub_end_y + swing_sun_clamp_gap;
+nip_drive_hub_end_y = nip_drive_clamp_start_y + nip_hub_end_y - nip_clamp_start_y;
+nip_idler_phase = swing_mesh_phase(swing_shaft, nip_idler_center, 0, nip_drive_gear_teeth);
+nip_gear_phase = swing_mesh_phase(nip_idler_center, nip_center, nip_idler_phase, swing_gear_teeth, nip_gear_teeth);
 nip_pad_cast_tip_x = exit_nip_tongue_wall + exit_nip_tongue_slot;
 nip_pad_cast_recess_x = [exit_nip_x - (exit_nip_pad_size[0] * 0.5) - exit_nip_pad_clearance, exit_nip_x + (exit_nip_pad_size[0] * 0.5) + exit_nip_pad_clearance];
 nip_pad_cast_recess_half_width = (exit_nip_pad_size[1] * 0.5) + exit_nip_pad_clearance;
@@ -2834,6 +2854,11 @@ module exit_nip_tongue()
             }
         }
         translate([pad_x, -pad_half_width, exit_insert_lip_height - exit_nip_pad_size[2]]) cube([pad_length, pad_half_width * 2, exit_nip_pad_size[2] + epsilon]);
+        rib_pitch = ((half_width * 2) - exit_nip_tongue_rib_width) / (exit_nip_tongue_rib_count - 1);
+        for (i = [0:exit_nip_tongue_rib_count - 2])
+        {
+            translate([stiff_end_x, -half_width + exit_nip_tongue_rib_width + (i * rib_pitch), flex_bottom - epsilon]) cube([exit_nip_tongue_root_x - stiff_end_x, rib_pitch - exit_nip_tongue_rib_width, top - flex_bottom + (epsilon * 2)]);
+        }
         for (side = [0, 1])
         {
             mirror([0, side, 0])
@@ -2894,14 +2919,14 @@ module swing_link(a, radius_a, b, radius_b)
 function involute_angle(pressure_angle) = (tan(pressure_angle) - (pressure_angle * PI / 180)) * 180 / PI;
 function polar(radius, angle) = [radius * cos(angle), radius * sin(angle)];
 
-module spur_gear_2d(teeth)
+module spur_gear_2d(teeth, profile_shift = 0, addendum = swing_gear_module)
 {
     pitch_radius = swing_gear_module * teeth * 0.5;
     base_radius = pitch_radius * cos(swing_gear_pressure_angle);
-    tip_radius = pitch_radius + swing_gear_module;
-    root_radius = pitch_radius - (swing_gear_module * 1.25);
+    tip_radius = pitch_radius + addendum;
+    root_radius = pitch_radius - (swing_gear_module * (1.25 - profile_shift));
     max_roll = sqrt(pow(tip_radius / base_radius, 2) - 1);
-    half_angle = (90 / teeth) + involute_angle(swing_gear_pressure_angle) - ((swing_gear_backlash * 0.5 / pitch_radius) * 180 / PI);
+    half_angle = (90 / teeth) + involute_angle(swing_gear_pressure_angle) + ((((profile_shift * swing_gear_module * tan(swing_gear_pressure_angle)) - (swing_gear_backlash * 0.5)) / pitch_radius) * 180 / PI);
     steps = 8;
     flank = [for (i = [0:steps]) let (t = max_roll * i / steps) polar(base_radius * sqrt(1 + (t * t)), half_angle - ((t * 180 / PI) - atan(t)))];
     mirrored = [for (i = [steps:-1:0]) [flank[i][0], -flank[i][1]]];
@@ -2922,9 +2947,9 @@ function swing_elbow(a, b, length_a, length_b) =
         a + (u * along) + ([u[1], -u[0]] * sqrt((length_a * length_a) - (along * along)));
 
 // Rotation of a gear meshing with one at the given rotation, along the line between their centres.
-function swing_mesh_phase(from, to, from_phase) =
-    let (pitch = 360 / swing_gear_teeth, centre_angle = atan2(to[1] - from[1], to[0] - from[0]), offset = centre_angle - from_phase - (pitch * round((centre_angle - from_phase) / pitch)))
-        centre_angle + 180 + (pitch * 0.5) + offset;
+function swing_mesh_phase(from, to, from_phase, from_teeth = swing_gear_teeth, to_teeth = swing_gear_teeth) =
+    let (pitch = 360 / from_teeth, centre_angle = atan2(to[1] - from[1], to[0] - from[0]), offset = centre_angle - from_phase - (pitch * round((centre_angle - from_phase) / pitch)))
+        centre_angle + 180 + (180 / to_teeth) + (offset * from_teeth / to_teeth);
 
 // All three gears sit in the same plane between the drive arm and the roller.
 module swing_gear(center, phase)
@@ -2989,7 +3014,7 @@ module swing_sun_gear()
                 xz_extrude(clamp_start_y + chamfer, hub_end_y) swing_clamp_2d(swing_shaft, swing_hub_radius, swing_sun_clamp_radius);
             }
         }
-        y_bore(swing_shaft, swing_sun_bore_radius, -swing_gear_outer_y, hub_end_y, $fn=100);
+        y_bore(swing_shaft, swing_gear_bore_radius, -swing_gear_outer_y, hub_end_y, $fn=100);
         swing_clamp_cut(swing_shaft, (clamp_start_y + chamfer + hub_end_y) * 0.5, swing_sun_clamp_radius);
     }
 }
@@ -3109,17 +3134,15 @@ module nip_roller()
 }
 
 // A gear in the nip's plane, clamped to its rod by a hub on its outer side like the sun gear's.
-module nip_clamped_gear(center, phase)
+module nip_clamped_gear(center, phase, teeth, profile_shift, addendum, clamp_start_y, hub_end_y)
 {
-    hub_end_y = nip_hub_end_y;
-    clamp_start_y = nip_gear_y[1] + swing_sun_clamp_gap;
     chamfer = swing_sun_clamp_radius - swing_hub_radius;
 
     union() difference()
     {
         union()
         {
-            xz_extrude(nip_gear_y[0], nip_gear_y[1]) translate(center) rotate(phase) spur_gear_2d(swing_gear_teeth);
+            xz_extrude(nip_gear_y[0], nip_gear_y[1]) translate(center) rotate(phase) spur_gear_2d(teeth, profile_shift, addendum);
             hull()
             {
                 y_cylinder(center, swing_hub_neck_radius, nip_gear_y[1], nip_gear_y[1] + epsilon, $fn=100);
@@ -3131,19 +3154,19 @@ module nip_clamped_gear(center, phase)
                 xz_extrude(clamp_start_y + chamfer, hub_end_y) swing_clamp_2d(center, swing_hub_radius, swing_sun_clamp_radius);
             }
         }
-        y_bore(center, swing_sun_bore_radius, nip_gear_y[0], hub_end_y, $fn=100);
+        y_bore(center, swing_gear_bore_radius, nip_gear_y[0], hub_end_y, $fn=100);
         swing_clamp_cut(center, (clamp_start_y + chamfer + hub_end_y) * 0.5, swing_sun_clamp_radius);
     }
 }
 
 module nip_drive_gear()
 {
-    nip_clamped_gear(swing_shaft, 0);
+    nip_clamped_gear(swing_shaft, 0, nip_drive_gear_teeth, nip_drive_gear_profile_shift, nip_drive_gear_addendum, nip_drive_clamp_start_y, nip_drive_hub_end_y);
 }
 
 module nip_gear()
 {
-    nip_clamped_gear(nip_center, nip_gear_phase);
+    nip_clamped_gear(nip_center, nip_gear_phase, nip_gear_teeth, nip_gear_profile_shift, nip_gear_addendum, nip_clamp_start_y, nip_hub_end_y);
 }
 
 module nip_idler_gear()
@@ -3555,7 +3578,7 @@ module swing_externals()
 {
     color("blue")
     {
-        y_cylinder(swing_shaft, swing_rod_radius, swing_motor_face_y + (swing_coupler_length * 0.5), nip_hub_end_y, $fn=100);
+        y_cylinder(swing_shaft, swing_rod_radius, swing_motor_face_y + (swing_coupler_length * 0.5), nip_drive_hub_end_y, $fn=100);
         y_cylinder(nip_center, swing_rod_radius, swing_drive_support_y[0], nip_hub_end_y, $fn=100);
         // Long enough to reach half way through both supports' axle stops.
         swing_pose(swing_arm_angle) y_cylinder(swing_roller_center, swing_axle_radius, (swing_drive_support_y[0] + swing_drive_support_y[1]) * 0.5, (swing_idle_support_y[0] + swing_idle_support_y[1]) * 0.5, $fn=100);

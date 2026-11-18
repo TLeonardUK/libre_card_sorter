@@ -202,6 +202,11 @@ class WorkflowExecutionState:
                 return bin_index
         return 0
 
+    def __select_unknown_card_bin(self):
+        bin_index = self.__find_unknown_card_bin_index()
+        self.__bin_states[bin_index].card_count += 1
+        return bin_index
+
     # Gets the given card attribute by name
     def __get_card_attribute(self, card_identity, attribute_name):
         # Couple of special attributes that are retrieved from different places.
@@ -313,7 +318,7 @@ class WorkflowExecutionState:
     def select_bin(self, card_identity):
         # If card was unrecognized
         if (card_identity == None):
-            return self.__find_unknown_card_bin_index()
+            return self.__select_unknown_card_bin()
 
         # Find bins we can match against.
         matching_bin_index_and_archetype_indexes_and_priority = []
@@ -343,7 +348,7 @@ class WorkflowExecutionState:
 
         # No matching bins? Find one that is empty.
         if (len(matching_bin_index_and_archetype_indexes_and_priority) == 0):
-            return self.__find_unknown_card_bin_index()
+            return self.__select_unknown_card_bin()
 
         # Get the match with the highest priority.
         sorted_bins = sorted(matching_bin_index_and_archetype_indexes_and_priority, key=lambda tup: tup[2])
